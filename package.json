@@ -1,0 +1,17 @@
+{
+  "name": "lyricsplus",
+  "version": "0.0.1",
+  "type": "module",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "start": "node src/index.js"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "jose": "^6.0.11"
+  }
+}
