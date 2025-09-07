@@ -2,12 +2,10 @@
 // src/handlers/lyrics.js
 import { handleSongLyrics, safeFetchSongs } from "../controllers/lyricsHandler.js";
 import { createJsonResponse } from "../utils/responseHelper.js";
-import { convertJsonToTTML, v1Tov2 } from "../utils/mapHandler.js";
+import { convertJsonToTTML, v2Tov1 } from "../utils/mapHandler.js";
 import GoogleDrive from "../utils/googleDrive.js";
 
 const gd = new GoogleDrive();
-
-
 
 export async function handleLyricsGet(request, env, ctx) {
     const startTime = Date.now();
@@ -38,7 +36,7 @@ export async function handleLyricsGet(request, env, ctx) {
         forceReload,
         env
     );
-    const data = result.data;
+    const data = v2Tov1(result.data);
     data.processingTime = {
         timeElapsed: Date.now() - startTime,
         lastProcessed: Date.now(),
@@ -85,11 +83,7 @@ export async function handleLyricsGetV2(request, env, ctx) {
         env
     );
     let data;
-    try {
-        data = v1Tov2(result.data);
-    } catch (e) {
-        data = result.data;
-    }
+    data = result.data;
     data.processingTime = {
         timeElapsed: Date.now() - startTime,
         lastProcessed: Date.now(),
@@ -138,7 +132,7 @@ export async function handleTtmlGet(request, env, ctx) {
     let data = {};
     let tempData;
     try {
-        tempData = v1Tov2(result.data);
+        tempData = result.data;
         tempData = convertJsonToTTML(tempData);
         data.ttml = tempData
     } catch (e) {

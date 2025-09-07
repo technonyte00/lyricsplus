@@ -12,13 +12,14 @@ export class FileUtils {
 
         // Include album in the filename if provided
         const albumPart = songAlbum ? ` [${songAlbum.trim()}]` : '';
-        // Format duration if provided
+        // Format duration if provided (now in total seconds format, potentially with decimals)
         const durationPart = songDuration ? ` (${formatDuration(songDuration)})` : '';
         
-        return `${songArtist.trim()} - ${songTitle.trim()}${albumPart}${durationPart}`
+        const filename = `${songArtist.trim()} - ${songTitle.trim()}${albumPart}${durationPart}`
             .replace(/[<>:"/\\|?*]/g, '')
             .replace(/\s+/g, ' ')
             .trim();
+        return filename;
     }
 
     // Searches for an existing file on Google Drive based on provided song details
@@ -58,7 +59,7 @@ export class FileUtils {
     
             // Extract metadata from filenames for proper comparison
             const parsedCandidates = response.files.map(file => {
-                // Parse filename using the format: Artist - Track Title [Album] (duration).ext
+                // Parse filename using the format: Artist - Track Title [Album] (seconds.milliseconds).ext
                 const fileInfo = {};
                 fileInfo.originalFile = file;
                 
@@ -67,20 +68,14 @@ export class FileUtils {
                 const nameParts = fullName.split('.');
                 const nameWithoutExt = nameParts.slice(0, -1).join('.');
                 
-                // Extract duration if present (handles both (MM:SS) and (Seconds) formats)
-                const durationMatch = nameWithoutExt.match(/\((\d+)(?::(\d+(?:\.\d+)?))?\)$/);
+                // Extract duration if present (handles (Seconds.milliseconds) format)
+                // The regex now looks for one or more digits, optionally followed by a dot and more digits.
+                const durationMatch = nameWithoutExt.match(/\((\d+(?:\.\d+)?)\)$/);
                 if (durationMatch) {
-                    let durationInSeconds;
-                    if (durationMatch[2] !== undefined) { // MM:SS format
-                        const minutes = parseInt(durationMatch[1], 10);
-                        const seconds = parseFloat(durationMatch[2]);
-                        durationInSeconds = minutes * 60 + seconds;
-                    } else { // Seconds only format
-                        durationInSeconds = parseInt(durationMatch[1], 10);
-                    }
-                    fileInfo.duration = durationInSeconds;
+                    // Use parseFloat to correctly handle decimal numbers
+                    fileInfo.duration = parseFloat(durationMatch[1]);
                     // Remove duration part from the name for further parsing
-                    fileInfo.nameWithoutDuration = nameWithoutExt.replace(/\s*\(\d+(?::\d+(?:\.\d+)?)?\)$/, '');
+                    fileInfo.nameWithoutDuration = nameWithoutExt.replace(/\s*\(\d+(?:\.\d+)?\)$/, '');
                 } else {
                     fileInfo.nameWithoutDuration = nameWithoutExt;
                     fileInfo.duration = undefined;
@@ -103,7 +98,6 @@ export class FileUtils {
                     fileInfo.artist = artistTitleMatch[1].trim();
                     fileInfo.title = artistTitleMatch[2].trim();
                 } else {
-                    // If there's no dash separator, assume it's just a title
                     fileInfo.title = fileInfo.nameWithoutAlbum.trim();
                     fileInfo.artist = undefined;
                 }
@@ -179,12 +173,14 @@ export class FileUtils {
     }
 }
 
-// Helper function to format duration in MM:SS format
+// Helper function to format duration in total seconds (s) format, allowing decimals
 function formatDuration(durationInSeconds) {
     if (durationInSeconds === undefined || durationInSeconds === null) return '';
     
-    const minutes = Math.floor(durationInSeconds / 60);
-    const seconds = Math.floor(durationInSeconds % 60);
-    
-    return `${minutes}:${seconds.toString().padStart(2, '0')}`;
+    // Convert to a fixed number of decimal places (e.g., 2 for milliseconds precision)
+    // This prevents extremely long decimal numbers in filenames.
+    // Use Number() to convert the fixed string back to a number, which removes trailing .00
+    // Example: (185.00) becomes (185)
+    // Example: (185.75) stays (185.75)
+    return `${Number(durationInSeconds).toFixed(2)}`;
 }

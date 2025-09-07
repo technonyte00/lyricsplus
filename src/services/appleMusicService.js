@@ -1,7 +1,4 @@
-// services/appleMusicService.js
-
-const CACHE = { storefront: null, authToken: null };
-import { APPLE_MUSIC, GDRIVE } from "../config.js";
+import { APPLE_MUSIC, GDRIVE, appleMusicAccountManager } from "../config.js";
 import { convertTTMLtoJSON } from "../utils/mapHandler.js";
 import { SimilarityUtils } from "../utils/similarityUtils.js";
 import { FileUtils } from "../utils/fileUtils.js";
@@ -9,381 +6,265 @@ import { LyricsPlusService } from "./lyricsPlusService.js";
 import GoogleDrive from "../utils/googleDrive.js";
 
 const gd = new GoogleDrive();
+const CACHE = { storefront: null, authToken: null };
+const MAX_RETRIES = 3;
 
 export class AppleMusicService {
-    static async getAppleMusicAuth() {
-        if (APPLE_MUSIC.AUTH_TYPE === "android") {
-            return APPLE_MUSIC.ANDROID_AUTH_TOKEN;
-        }
 
-        if (!CACHE.authToken) {
-            try {
-                const response = await fetch("https://music.apple.com/");
-                const html = await response.text();
-                const scriptTagMatch = html.match(/<script type="module" crossorigin src="(\/assets\/index-[^"]+\.js)"><\/script>/);
+    // --- Public API ---
 
-                if (!scriptTagMatch?.[1]) {
-                    throw new Error("Apple Music script tag not found");
-                }
+    static async fetchLyrics(originalSongTitle, originalSongArtist, originalSongAlbum, originalSongDuration, songs, gd, forceReload, sources) {
+        try {
+            const initialCacheResult = await this._checkCache(originalSongTitle, originalSongArtist, originalSongAlbum, originalSongDuration, songs, gd, forceReload, sources);
+            if (initialCacheResult) {
+                console.debug('Apple Music lyrics found in cache (initial check).');
+                return initialCacheResult;
+            }
 
-                const scriptUrl = new URL(scriptTagMatch[1], "https://music.apple.com/").toString();
-                const jsResponse = await fetch(scriptUrl);
-                const jsContent = await jsResponse.text();
-
-                const authorizationMatch = jsContent.match(/e\.headers\.Authorization\s*=\s*`Bearer \${(.*?)}`/);
-                if (!authorizationMatch?.[1]) {
-                    throw new Error("Authorization token variable not found");
-                }
-
-                const variableName = authorizationMatch[1];
-                const variableMatch = jsContent.match(new RegExp(`const ${variableName}\\s*=\\s*"([^"]+)"`));
-
-                if (!variableMatch?.[1]) {
-                    throw new Error("Authorization token value not found");
-                }
-
-                CACHE.authToken = variableMatch[1];
-            } catch (error) {
-                console.error("Error fetching Apple Music auth token:", error);
+            console.debug('No cached lyrics found, searching Apple Music...');
+            const bestMatch = await this._searchForBestMatch(originalSongTitle, originalSongArtist, originalSongAlbum, originalSongDuration);
+            if (!bestMatch) {
+                console.warn('No suitable match found in Apple Music search.');
                 return null;
             }
+
+            const { name, artistName, albumName, durationInMillis } = bestMatch.attributes;
+            const exactMetadata = { title: name, artist: artistName, album: albumName, durationMs: durationInMillis };
+            console.debug(`Selected match: ${artistName} - ${name} (Album: ${albumName}, Duration: ${durationInMillis / 1000}s)`);
+
+            const postSearchCacheResult = await this._checkCache(name, artistName, albumName, durationInMillis / 1000, songs, gd, forceReload, sources);
+            if (postSearchCacheResult) {
+                console.debug('Apple Music lyrics found in cache (post-search check).');
+                return postSearchCacheResult;
+            }
+
+            const storefront = await this.getStorefront();
+            const lyricsResponse = await this.makeAppleMusicRequest(
+                `${APPLE_MUSIC.BASE_URL}/catalog/${storefront}/songs/${bestMatch.id}/syllable-lyrics?l%5Blyrics%5D=en-US&extend=ttmlLocalizations&l%5Bscript%5D=en-Latn`, {}
+            );
+            const lyricsData = await lyricsResponse.json();
+            const ttml = lyricsData.data?.[0]?.attributes?.ttml || lyricsData.data?.[0]?.attributes?.ttmlLocalizations;
+
+            if (!ttml) {
+                console.warn('Lyrics TTML not found in API response.');
+                return null;
+            }
+
+            const convertedToJson = convertTTMLtoJSON(ttml);
+            if (!convertedToJson.lyrics || convertedToJson.lyrics.length === 0) {
+                console.warn('Fetched lyrics are empty.');
+                return null;
+            }
+
+            convertedToJson.metadata = convertedToJson.metadata || {};
+            convertedToJson.metadata.source = 'Apple';
+            convertedToJson.cached = 'None';
+            convertedToJson.metadata.appleMusicId = bestMatch.id;
+
+            return { success: true, data: convertedToJson, source: 'apple', rawData: ttml, existingFile: null, exactMetadata };
+
+        } catch (error) {
+            console.warn('Failed to fetch from Apple Music:', error);
+            return null;
         }
-        return CACHE.authToken;
+    }
+
+    static async searchSong(query, storefront) {
+        if (!query) return { results: { songs: { data: [] } } };
+        const response = await this.makeAppleMusicRequest(
+            `${APPLE_MUSIC.BASE_URL}/catalog/${storefront}/search?types=songs&term=${encodeURIComponent(query)}`, {}
+        );
+        return response.json();
+    }
+
+    // --- Core Request & Auth Logic ---
+
+    static async makeAppleMusicRequest(url, options, retries = 0) {
+        try {
+            const headers = await this._getAuthHeaders();
+            const response = await fetch(url, { ...options, headers: { ...headers, ...options.headers } });
+
+            if (!response.ok) {
+                if ((response.status === 401 || response.status === 429) && retries < MAX_RETRIES) {
+                    console.warn(`Apple Music API call failed with status ${response.status}. Retrying with next account...`);
+                    appleMusicAccountManager.switchToNextAccount();
+                    CACHE.authToken = null;
+                    CACHE.storefront = null;
+                    return this.makeAppleMusicRequest(url, options, retries + 1);
+                }
+                const errorText = await response.text();
+                throw new Error(`Apple Music API returned status ${response.status}: ${errorText}`);
+            }
+            return response;
+        } catch (error) {
+            console.error("Error in makeAppleMusicRequest:", error);
+            throw error;
+        }
+    }
+
+    static async getAppleMusicAuth() {
+        const currentAccount = appleMusicAccountManager.getCurrentAccount();
+        if (!currentAccount) throw new Error("No Apple Music account available.");
+        if (currentAccount.AUTH_TYPE === "android") return currentAccount.ANDROID_AUTH_TOKEN;
+
+        if (CACHE.authToken) return CACHE.authToken;
+
+        try {
+            const response = await fetch("https://music.apple.com/");
+            const html = await response.text();
+            const scriptTagMatch = html.match(/<script type="module" crossorigin src="(\/assets\/index-[^"]+\.js)"><\/script>/);
+            if (!scriptTagMatch?.[1]) throw new Error("Could not find Apple Music index script tag.");
+
+            const scriptUrl = new URL(scriptTagMatch[1], "https://music.apple.com/").toString();
+            const jsResponse = await fetch(scriptUrl);
+            const jsContent = await jsResponse.text();
+
+            const tokenVarMatch = jsContent.match(/e\.headers\.Authorization\s*=\s*`Bearer \${(.*?)}`/);
+            if (!tokenVarMatch?.[1]) throw new Error("Could not find authorization token variable in script.");
+
+            const tokenValueMatch = jsContent.match(new RegExp(`const ${tokenVarMatch[1]}\\s*=\\s*"([^"]+)"`));
+            if (!tokenValueMatch?.[1]) throw new Error("Could not find authorization token value in script.");
+
+            CACHE.authToken = tokenValueMatch[1];
+            return CACHE.authToken;
+        } catch (error) {
+            console.error("Error scraping Apple Music auth token:", error);
+            throw error;
+        }
     }
 
     static async getStorefront() {
-        if (!CACHE.storefront) {
-            const token = await this.getAppleMusicAuth();
-            const headers = APPLE_MUSIC.AUTH_TYPE === "android" ? {
-                Authorization: `Bearer ${token}`,
-                "x-dsid": APPLE_MUSIC.ANDROID_DSID,
-                "User-Agent": APPLE_MUSIC.ANDROID_USER_AGENT,
-                "Cookie": APPLE_MUSIC.ANDROID_COOKIE,
-                "Accept-Encoding": "gzip"
-            } : {
-                Authorization: `Bearer ${token}`,
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
-                Origin: 'https://music.apple.com',
-                Referer: 'https://music.apple.com',
-                'media-user-token': APPLE_MUSIC.MUSIC_AUTH_TOKEN
-            };
+        if (CACHE.storefront) return CACHE.storefront;
+        const currentAccount = appleMusicAccountManager.getCurrentAccount();
+        if (!currentAccount) throw new Error("No Apple Music account available.");
 
-            const storefrontResponse = await fetch("https://api.music.apple.com/v1/me/storefront", {
-                headers: headers,
-            });
-            try {
-                const storefrontData = await storefrontResponse.json();
-                CACHE.storefront = storefrontData.data[0].id;
-            } catch (err) {
-                console.debug("using default storeid");
-                CACHE.storefront = "us";
-            }
+        if (currentAccount.AUTH_TYPE === "android" && currentAccount.STOREFRONT) {
+            CACHE.storefront = currentAccount.STOREFRONT;
+            return CACHE.storefront;
+        }
+        
+        try {
+            const response = await this.makeAppleMusicRequest("https://api.music.apple.com/v1/me/storefront", {});
+            const data = await response.json();
+            CACHE.storefront = data.data[0].id;
+        } catch (err) {
+            CACHE.storefront = currentAccount.STOREFRONT || "us";
+            console.warn(`Could not fetch storefront, falling back to: ${CACHE.storefront}`);
         }
         return CACHE.storefront;
     }
 
-    static async saveSongs(updatedSongs) {
-      // Save songs to Google Drive
-      const content = typeof updatedSongs === "string" ? updatedSongs : JSON.stringify(updatedSongs, null, 0);
-      await gd.updateFile(GDRIVE.SONGS_FILE_ID, content);
-    }
+    // --- Data Fetching & Normalization ---
 
-    static async searchSong(query, dev_token, storefront) {
-        if (!query) return { results: { songs: { data: [] } } };
-
-        const headers = APPLE_MUSIC.AUTH_TYPE === "android" ? {
-            Authorization: `Bearer ${dev_token}`,
-            "x-dsid": APPLE_MUSIC.ANDROID_DSID,
-            "User-Agent": APPLE_MUSIC.ANDROID_USER_AGENT,
-            "Cookie": APPLE_MUSIC.ANDROID_COOKIE,
-            "Accept-Encoding": "gzip"
-        } : {
-            Authorization: `Bearer ${dev_token}`,
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
-            "media-user-token": APPLE_MUSIC.MUSIC_AUTH_TOKEN,
-            Origin: 'https://music.apple.com',
-            Referer: 'https://music.apple.com',
-        };
-
-        const response = await fetch(
-            `${APPLE_MUSIC.BASE_URL}/catalog/${storefront}/search?types=songs&term=${encodeURIComponent(query)}`,
-            {
-                headers: headers,
-            }
-        );
-
-        if (!response.ok) {
-            const errorText = await response.text();
-            throw new Error(`Apple Music API returned status ${response.status}: ${errorText}`);
-        }
-
-        return response.json();
-    }
-
-    /**
-     * Fetches ISRC for a given Apple Music song ID.
-     * Apple Music API does not directly provide ISRC in search results,
-     * so we need to fetch the full song details.
-     * @param {string} songId - The Apple Music song ID.
-     * @param {string} dev_token - The developer token.
-     * @param {string} storefront - The storefront ID.
-     * @returns {Promise<string|null>} The ISRC code or null if not found.
-     */
-    static async fetchIsrc(songId, dev_token, storefront) {
+    static async fetchIsrc(songId, storefront) {
         try {
-            const headers = APPLE_MUSIC.AUTH_TYPE === "android" ? {
-                Authorization: `Bearer ${dev_token}`,
-                "x-dsid": APPLE_MUSIC.ANDROID_DSID,
-                "User-Agent": APPLE_MUSIC.ANDROID_USER_AGENT,
-                "Cookie": APPLE_MUSIC.ANDROID_COOKIE,
-                "Accept-Encoding": "gzip"
-            } : {
-                Authorization: `Bearer ${dev_token}`,
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
-                "media-user-token": APPLE_MUSIC.MUSIC_AUTH_TOKEN,
-                Origin: 'https://music.apple.com',
-                Referer: 'https://music.apple.com',
-            };
-
-            const response = await fetch(
-                `${APPLE_MUSIC.BASE_URL}/catalog/${storefront}/songs/${songId}`,
-                {
-                    headers: headers,
-                }
-            );
-
-            if (!response.ok) {
-                const errorText = await response.text();
-                throw new Error(`Failed to fetch Apple Music song details for ISRC with status ${response.status}: ${errorText}`);
-            }
-
+            const response = await this.makeAppleMusicRequest(`${APPLE_MUSIC.BASE_URL}/catalog/${storefront}/songs/${songId}`, {});
             const data = await response.json();
-            return data.data?.[0]?.attributes || null; // Return full attributes
+            return data.data?.[0]?.attributes || null;
         } catch (error) {
             console.error("Error fetching Apple Music song details:", error);
             return null;
         }
     }
 
-    /**
-     * Normalizes an Apple Music track object into the custom song catalog format.
-     * @param {object} track - The Apple Music track object.
-     * @param {string} dev_token - The developer token (needed for ISRC fetch).
-     * @param {string} storefront - The storefront ID (needed for ISRC fetch).
-     * @returns {Promise<object>} The normalized song object.
-     */
-    static async normalizeAppleMusicSong(track, dev_token, storefront) {
+    static async normalizeAppleMusicSong(track, storefront) {
         const attributes = track.attributes;
-        const albumArtUrl = attributes.artwork?.url ? attributes.artwork.url.replace('{w}', '300').replace('{h}', '300') : null;
-
-        // Fetch full song details to get ISRC and potentially more attributes like songwriters
-        const fullSongAttributes = await this.fetchIsrc(track.id, dev_token, storefront);
-        const isrc = fullSongAttributes?.isrc || null;
-        const songwriters = fullSongAttributes?.songwriterNames || attributes.songwriterNames || []; // Prioritize full details, then search results
+        const fullSongAttributes = await this.fetchIsrc(track.id, storefront);
 
         return {
-            id: { appleMusic: track.id }, // New ID structure
-            sourceId: track.id, // Individual service ID
+            id: { appleMusic: track.id },
+            sourceId: track.id,
             title: attributes.name,
             artist: attributes.artistName,
             album: attributes.albumName,
-            albumArtUrl: albumArtUrl,
+            albumArtUrl: attributes.artwork?.url.replace('{w}', '300').replace('{h}', '300') || null,
             durationMs: attributes.durationInMillis,
-            isrc: isrc,
-            songwriters: songwriters,
-            availability: ['Apple Music'], // New availability field
-            externalUrls: {
-                appleMusic: attributes.url
-            }
+            isrc: fullSongAttributes?.isrc || null,
+            songwriters: fullSongAttributes?.songwriterNames || attributes.songwriterNames || [],
+            availability: ['Apple Music'],
+            externalUrls: { appleMusic: attributes.url }
         };
     }
 
-    static async fetchLyrics(originalSongTitle, originalSongArtist, originalSongAlbum, originalSongDuration, songs, gd, forceReload, sources) {
-        let songTitle = originalSongTitle;
-        let songArtist = originalSongArtist;
-        let songAlbum = originalSongAlbum;
-        let songDuration = originalSongDuration;
+    // --- Internal Helpers ---
 
-        let bestMatch = null;
-        let dev_token = null;
-        let storefront = null;
+    static async _getAuthHeaders() {
+        const currentAccount = appleMusicAccountManager.getCurrentAccount();
+        if (!currentAccount) throw new Error("No Apple Music account available.");
 
-        try {
-            dev_token = await this.getAppleMusicAuth();
-            storefront = await this.getStorefront();
+        if (currentAccount.AUTH_TYPE === "android") {
+            return {
+                Authorization: `Bearer ${currentAccount.ANDROID_AUTH_TOKEN}`,
+                "x-dsid": currentAccount.ANDROID_DSID,
+                "User-Agent": currentAccount.ANDROID_USER_AGENT,
+                "Cookie": currentAccount.ANDROID_COOKIE,
+                "Accept-Encoding": "gzip"
+            };
+        } else {
+            return {
+                Authorization: `Bearer ${await this.getAppleMusicAuth()}`,
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+                Origin: 'https://music.apple.com',
+                Referer: 'https://music.apple.com',
+                'media-user-token': currentAccount.MUSIC_AUTH_TOKEN
+            };
+        }
+    }
 
-            const searchQueries = [
-                [originalSongTitle, originalSongArtist, originalSongAlbum].filter(Boolean).join(' '),
-                [originalSongTitle, originalSongArtist].filter(Boolean).join(' '),
-                `${originalSongArtist} ${originalSongTitle}`,
-                originalSongTitle
-            ];
+    static async _searchForBestMatch(title, artist, album, duration) {
+        const storefront = await this.getStorefront();
+        const searchQueries = [
+            [title, artist, album].filter(Boolean).join(' '),
+            [title, artist].filter(Boolean).join(' '),
+            `${artist} ${title}`,
+            title
+        ];
 
-            let candidates = [];
-
-            for (const query of searchQueries) {
-                console.debug(`Searching Apple Music with query: "${query}"`);
-                const searchData = await this.searchSong(query, dev_token, storefront);
-                const newCandidates = searchData.results?.songs?.data || [];
-                candidates.push(...newCandidates);
-
-                bestMatch = SimilarityUtils.findBestSongMatch(candidates, originalSongTitle, originalSongArtist, originalSongAlbum, originalSongDuration);
-                if (bestMatch) break;
-            }
-
-            if (!bestMatch) {
-                console.warn('No suitable candidates found in Apple Music search');
-                return null;
-            }
-
-            // Update song metadata with exact details from the best match
-            const firstResult = bestMatch.candidate;
-            songTitle = firstResult.attributes.name;
-            songArtist = firstResult.attributes.artistName;
-            songAlbum = firstResult.attributes.albumName || null;
-            songDuration = firstResult.attributes.durationInMillis / 1000;
-
-            console.debug(`Selected match: ${songArtist} - ${songTitle} (Album: ${songAlbum}, Duration: ${songDuration}s)`);
-
-            // Find matching song in local cache using updated metadata
-            let song = songs.find(
-                s => s && s.track_name?.toLowerCase() === songTitle?.toLowerCase() &&
-                    s.artist?.toLowerCase() === songArtist?.toLowerCase() &&
-                    (!songAlbum || s.album?.toLowerCase() === songAlbum?.toLowerCase()) &&
-                    (!songDuration || !s.duration || Math.abs(s.duration - songDuration) <= 3)
-            );
-
-            // Find existing file for update if needed using updated metadata
-            let existingFile = await FileUtils.findExistingTTML(gd, songTitle, songArtist, songAlbum, songDuration);
-
-            // Use DB cache if available and not forcing reload
-            if (!forceReload && song?.ttmlFileId) {
-                try {
-                    const ttmlContent = await gd.fetchFile(song.ttmlFileId.id);
-                    if (ttmlContent) {
-                        const convertedToJson = convertTTMLtoJSON(ttmlContent);
-                        if (!convertedToJson.lyrics || convertedToJson.lyrics.length === 0) {
-                            console.warn('Cached lyrics are empty, attempting to refetch');
-                        } else {
-                            convertedToJson.metadata = convertedToJson.metadata || {};
-                            convertedToJson.metadata.source = 'Apple';
-                            convertedToJson.cached = 'Database';
-
-                            // Check if Lyrics+ is preferred for non-syllable lyrics
-                            if (sources.includes('lyricsplus') && !FileUtils.hasSyllableSync(convertedToJson)) {
-                                const alt = await LyricsPlusService.fetchLyrics(songTitle, songArtist, songAlbum, songDuration, gd);
-                                if (alt?.success) return alt;
-                            }
-
-                            return { success: true, data: convertedToJson, source: 'apple', rawData: ttmlContent, existingFile: song.ttmlFileId };
-                        }
-                    }
-                } catch (error) {
-                    console.warn('Failed to fetch existing TTML, will try to refetch lyrics:', error);
-                }
-            }
-
-            // Use GDrive cache if available and not forcing reload
-            if (!forceReload && existingFile) {
-                try {
-                    const ttmlContent = await gd.fetchFile(existingFile.id);
-                    if (ttmlContent) {
-                        // Store in local database if not already there
-                        if (!song) {
-                            song = {
-                                artist: songArtist,
-                                track_name: songTitle,
-                                album: songAlbum,
-                                ttmlFileId: existingFile,
-                                source: 'Apple',
-                            };
-                            songs.push(song);
-                            await this.saveSongs(songs);
-                        }
-
-                        const convertedToJson = convertTTMLtoJSON(ttmlContent);
-                        convertedToJson.metadata = convertedToJson.metadata || {};
-                        convertedToJson.metadata.source = 'Apple';
-                        convertedToJson.cached = 'GDrive';
-
-                        // Check if Lyrics+ is on preferred for non-syllable lyrics
-                        if (sources.includes('lyricsplus') && !FileUtils.hasSyllableSync(convertedToJson)) {
-                            const alt = await LyricsPlusService.fetchLyrics(songTitle, songArtist, songAlbum, songDuration, gd);
-                            if (alt?.success) return alt;
-                        }
-
-                        return { success: true, data: convertedToJson, source: 'apple', rawData: ttmlContent, existingFile: existingFile };
-                    }
-                } catch (error) {
-                    console.warn('Failed to fetch existing file, will try to refetch lyrics:', error);
-                }
-            }
-
-            // Fetch syllable lyrics using the exact matched song ID
-            const lyricsResponse = await fetch(
-                `${APPLE_MUSIC.BASE_URL}/catalog/${storefront}/songs/${firstResult.id}/syllable-lyrics`,
-                {
-                    headers: APPLE_MUSIC.AUTH_TYPE === "android" ? {
-                        Authorization: `Bearer ${dev_token}`,
-                        "x-dsid": APPLE_MUSIC.ANDROID_DSID,
-                        "User-Agent": APPLE_MUSIC.ANDROID_USER_AGENT,
-                        "Cookie": APPLE_MUSIC.ANDROID_COOKIE,
-                        "Accept-Encoding": "gzip"
-                    } : {
-                        Authorization: `Bearer ${dev_token}`,
-                        Origin: 'https://music.apple.com',
-                        Referer: 'https://music.apple.com',
-                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
-                        'media-user-token': APPLE_MUSIC.MUSIC_AUTH_TOKEN,
-                    },
-                }
-            );
-
-            if (!lyricsResponse.ok) {
-                console.warn(`Failed to fetch lyrics: ${lyricsResponse.status}`);
-                return null;
-            }
-
-            const lyricsData = await lyricsResponse.json();
-            const lyrics = lyricsData.data?.[0]?.attributes?.ttml;
-
-            if (lyrics) {
-                // Generate filename using exact metadata from the matched song
-                const fileName = await FileUtils.generateUniqueFileName(
-                    songTitle,
-                    songArtist,
-                    songAlbum,
-                    songDuration
-                );
-
-                // Return converted data
-                const convertedToJson = convertTTMLtoJSON(lyrics);
-                if (!convertedToJson.lyrics || convertedToJson.lyrics.length === 0) {
-                    console.warn('Fetched lyrics are empty');
-                    return null;
-                } else {
-                    convertedToJson.metadata = convertedToJson.metadata || {};
-                    convertedToJson.metadata.source = 'Apple';
-                    convertedToJson.cached = existingFile ? 'Updated' : 'None';
-                    convertedToJson.metadata.appleMusicId = firstResult.id; // Add Apple Music ID to metadata
-                    return {
-                        success: true,
-                        data: convertedToJson,
-                        source: 'apple',
-                        rawData: lyrics,
-                        existingFile: existingFile,
-                        exactMetadata: {
-                            title: songTitle,
-                            artist: songArtist,
-                            album: songAlbum,
-                            durationMs: songDuration * 1000 // Convert back to milliseconds for consistency
-                        }
-                    };
-                }
-            }
-        } catch (error) {
-            console.warn('Failed to check Apple Music:', error);
+        let candidates = [];
+        for (const query of searchQueries) {
+            console.debug(`Searching Apple Music with query: "${query}"`);
+            const searchData = await this.searchSong(query, storefront);
+            candidates.push(...(searchData.results?.songs?.data || []));
+            const bestMatch = SimilarityUtils.findBestSongMatch(candidates, title, artist, album, duration);
+            if (bestMatch) return bestMatch.candidate;
         }
         return null;
+    }
+
+    static async _checkCache(title, artist, album, duration, songs, gd, forceReload, sources) {
+        if (forceReload) return null;
+
+        const handleCachedContent = async (ttmlContent, cacheType, file) => {
+            const converted = convertTTMLtoJSON(ttmlContent);
+            if (!converted.lyrics || converted.lyrics.length === 0) {
+                console.warn(`Cached lyrics from ${cacheType} are empty, refetching.`);
+                return null;
+            }
+            converted.metadata = converted.metadata || {};
+            converted.metadata.source = 'Apple';
+            converted.cached = cacheType;
+
+            if (sources.includes('lyricsplus') && !FileUtils.hasSyllableSync(converted)) {
+                const lpResult = await LyricsPlusService.fetchLyrics(title, artist, album, duration, gd);
+                if (lpResult?.success) return lpResult;
+            }
+            return { success: true, data: converted, source: 'apple', rawData: ttmlContent, existingFile: file };
+        };
+
+        const existingFile = await FileUtils.findExistingTTML(gd, title, artist, album, duration);
+        if (existingFile) {
+            try {
+                const ttmlContent = await gd.fetchFile(existingFile.id);
+                if (ttmlContent) return await handleCachedContent(ttmlContent, 'GDrive', existingFile);
+            } catch (error) {
+                console.warn('Failed to fetch from GDrive cache:', error);
+            }
+        }
+        return null;
+    }
+    
+    static async saveSongs(updatedSongs) {
+        const content = typeof updatedSongs === "string" ? updatedSongs : JSON.stringify(updatedSongs, null, 0);
+        await gd.updateFile(GDRIVE.SONGS_FILE_ID, content);
     }
 }

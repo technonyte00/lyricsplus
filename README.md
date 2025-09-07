@@ -23,8 +23,8 @@ The service prioritizes lyrics with word-level synchronization for a richer user
 
 The primary API endpoints are defined in `src/routes/index.js`. Some of the key endpoints include:
 
-*   `GET /v1/lyrics/get`: Fetches lyrics for a song.
-*   `GET /v2/lyrics/get`: Fetches lyrics in a different format.
+*   `GET /v1/lyrics/get`: Fetches lyrics for a song in legacy format.
+*   `GET /v2/lyrics/get`: Fetches lyrics in a newer and compact format.
 *   `GET /v1/ttml/get`: Fetches lyrics in TTML format.
 *   `GET /v1/metadata/get`: Fetches song metadata.
 *   `POST /v1/lyricsplus/submit`: Allows users to submit lyrics.

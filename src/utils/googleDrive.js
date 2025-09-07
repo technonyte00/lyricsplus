@@ -109,4 +109,19 @@ export default class GoogleDrive {
     if (!response.ok) throw handleApiError(data);
     return data.files || [];
   }
+
+  async deleteFile(fileId) {
+    const token = await this.authenticate();
+    const response = await fetch(
+      `${GDRIVE.API_URL}${fileId}`,
+      {
+        method: "DELETE",
+        headers: {
+          Authorization: `Bearer ${token}`
+        }
+      }
+    );
+    if (!response.ok) throw handleApiError(await response.text());
+    return true;
+  }
 }

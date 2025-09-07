@@ -9,22 +9,6 @@ import { handleSonglistSearch } from '../handlers/songCatalog.js';
 const routes = [
     {
         method: 'GET',
-        path: '/health',
-        handler: async (request, env, ctx) => {
-            return {
-                status: 200,
-                headers: { 'Content-Type': 'application/json' },
-                body: {
-                    status: "ok",
-                    timestamp: new Date().toISOString(),
-                    service: "LyricsPlus-Backend",
-                    environment: env.ENV || 'production'
-                }
-            };
-        }
-    },
-    {
-        method: 'GET',
         path: '/v1/lyrics/get',
         handler: handleLyricsGet
     },

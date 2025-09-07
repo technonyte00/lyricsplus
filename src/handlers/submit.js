@@ -8,8 +8,8 @@ import GoogleDrive from "../utils/googleDrive.js";
 
 const gd = new GoogleDrive();
 
-const POW_DIFFICULTY = 5; // A higher difficulty makes it harder for the client
-const POW_CHALLENGE_EXPIRATION = '240s'; // Challenges are valid for 240 seconds
+const POW_DIFFICULTY = 5; 
+const POW_CHALLENGE_EXPIRATION = '240s';
 
 async function createChallengeToken(challenge, secret) {
     const secretKey = new TextEncoder().encode(secret);

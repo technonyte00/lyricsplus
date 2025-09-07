@@ -1,4 +1,4 @@
-// Main handler file - lyricsHandler.js
+
 import { AppleMusicService } from "../services/appleMusicService.js";
 import { MusixmatchService } from "../services/musixmatchService.js";
 import { SpotifyService } from "../services/spotifyService.js";
@@ -11,10 +11,8 @@ const gd = new GoogleDrive();
 var cachedSongs;
 
 export async function fetchSongs() {
-  // Fetch songs from Google Drive
   if (!cachedSongs) {
     const fileContent = await gd.fetchFile(GDRIVE.SONGS_FILE_ID);
-    // Check if the content is already JSON
     if (typeof fileContent === "string" && (fileContent.trim().startsWith("{") || fileContent.trim().startsWith("["))) {
       cachedSongs = JSON.parse(fileContent || "[]");
     } else {
@@ -65,7 +63,7 @@ async function saveBestLyrics(source, fileName, rawData, convertedData, existing
             }
             // Update song database for Apple Music
             const newSong = {
-                id: convertedData.metadata.appleMusicId, // Assuming you add this to metadata in AppleMusicService
+                id: convertedData.metadata.appleMusicId, 
                 artist: songArtist,
                 track_name: songTitle,
                 album: songAlbum,
@@ -84,7 +82,7 @@ async function saveBestLyrics(source, fileName, rawData, convertedData, existing
             } else {
                 songs.push(newSong);
             }
-            await AppleMusicService.saveSongs(songs); // Assuming this method exists and handles saving
+            await AppleMusicService.saveSongs(songs); 
         } else if (source === 'musixmatch') {
             if (existingFile) {
                 fileId = await gd.updateFile(existingFile.id, JSON.stringify(rawData));
@@ -168,14 +166,12 @@ export async function handleSongLyrics(
     const successfulResults = results.filter(r => r && r.success && r.data && r.data.lyrics && r.data.lyrics.length > 0);
 
     if (successfulResults.length > 0) {
-        // Helper function to determine sync priority based on the actual data structure
         const getSyncPriority = (result) => {
             if (!result || !result.data) return 0;
 
             const sourceType = result.source ? result.source.toLowerCase() : '';
             const data = result.data;
 
-            // Musixmatch and Spotify provide a 'type' field
             if (sourceType.includes('musixmatch') || sourceType.includes('spotify')) {
                 const syncType = data.type ? data.type.toUpperCase() : '';
                 if (syncType === 'WORD' || syncType === 'SYLLABLE') return 3; // Best quality
@@ -189,36 +185,30 @@ export async function handleSongLyrics(
                 return FileUtils.hasSyllableSync(data) ? 3 : 2;
             }
 
-            return 1; // Default for any other case
         };
 
-        // Find the best result based on sync priority
         const bestResult = successfulResults.reduce((best, current) => {
             const bestPriority = getSyncPriority(best);
             const currentPriority = getSyncPriority(current);
             return currentPriority > bestPriority ? current : best;
         });
 
-        // Extract exact metadata from the best result for saving
-        // Use bestResult.exactMetadata if available, otherwise fallback to original or lyrics metadata
         const exactSongTitle = bestResult.exactMetadata?.title || bestResult.data.metadata.title || songTitle;
         const exactSongArtist = bestResult.exactMetadata?.artist || bestResult.data.metadata.artist || songArtist;
         const exactSongAlbum = bestResult.exactMetadata?.album || bestResult.data.metadata.album || songAlbum;
         const exactSongDuration = bestResult.exactMetadata?.durationMs ? bestResult.exactMetadata.durationMs / 1000 : (bestResult.data.metadata.durationMs ? bestResult.data.metadata.durationMs / 1000 : songDuration);
 
-        // Regenerate filename using exact metadata
         const finalFileName = await FileUtils.generateUniqueFileName(exactSongTitle, exactSongArtist, exactSongAlbum, exactSongDuration);
 
-        // Save the best result to Google Drive, but only if it's not already cached
         if (bestResult.rawData && bestResult.data.cached !== 'GDrive' && bestResult.data.cached !== 'Database') {
             await saveBestLyrics(
-                bestResult.source.toLowerCase().replace('-word', ''), // Normalize source name
-                finalFileName, // Use the filename generated with exact metadata
+                bestResult.source.toLowerCase().replace('-word', ''), //normalize musixmatch
+                finalFileName, 
                 bestResult.rawData,
                 bestResult.data,
                 bestResult.existingFile,
                 gd,
-                exactSongTitle, // Pass exact metadata for Apple Music song cache update
+                exactSongTitle, 
                 exactSongArtist,
                 exactSongAlbum,
                 exactSongDuration,
