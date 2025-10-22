@@ -1,5 +1,9 @@
-import { DOMParser } from '@xmldom/xmldom';
 
+const DOMParser = (typeof globalThis !== 'undefined' && globalThis.DOMParser) ? globalThis.DOMParser : null;
+
+if (!DOMParser) {
+  console.warn('Global DOMParser not found. For local Node development install @xmldom/xmldom or provide a DOMParser.');
+}
 /**
  * Konversi format LRCLIB API menjadi format JSON yang diinginkan
  * @param {Object} data - Data dari API LRC
